@@ -6,44 +6,42 @@ import time
 from pathlib import Path
 
 def find_video_files(directory):
-    """Find all video files in the directory and subdirectories, sort by filename."""
+    """Find all video files in the directory and sort them by filename."""
     video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.MP4', '.AVI', '.MOV', '.MKV')
     video_files = []
     
-    # Walk through directory and subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            # Skip hidden files and macOS metadata files
-            if file.startswith('.') or file.startswith('._'):
-                continue
-            if file.endswith(video_extensions):
-                # Store full path relative to base directory
-                full_path = os.path.join(root, file)
-                video_files.append(full_path)
+    for file in os.listdir(directory):
+        # Skip hidden files and macOS metadata files
+        if file.startswith('.') or file.startswith('._'):
+            continue
+        if file.endswith(video_extensions):
+            video_files.append(file)
     
-    # Sort by filename only (not full path) for chronological order
-    video_files.sort(key=lambda x: os.path.basename(x))
+    # Sort by filename (chronological order based on timestamp)
+    video_files.sort()
     return video_files
 
-def create_concat_file(video_files, concat_file_path):
+def create_concat_file(video_files, directory, concat_file_path):
     """Create a text file listing all videos for ffmpeg concat."""
     with open(concat_file_path, 'w') as f:
-        for video_path in video_files:
+        for video in video_files:
             # Use absolute paths and escape special characters
-            video_path = os.path.abspath(video_path).replace('\\', '/')
+            video_path = os.path.join(directory, video)
+            video_path = video_path.replace('\\', '/')
             f.write(f"file '{video_path}'\n")
 
-def get_total_size(video_files):
+def get_total_size(directory, video_files):
     """Calculate total size of all video files in MB."""
     total_bytes = 0
-    for video_path in video_files:
+    for video in video_files:
+        video_path = os.path.join(directory, video)
         try:
             total_bytes += os.path.getsize(video_path)
         except:
             pass
     return total_bytes / (1024 * 1024)  # Convert to MB
 
-def stitch_videos(directory, output_file, destination_dir=None):
+def stitch_videos(directory, output_file, destination_folder=None):
     """Stitch all videos in the directory into one file."""
     directory = os.path.abspath(directory)
     
@@ -51,54 +49,49 @@ def stitch_videos(directory, output_file, destination_dir=None):
         print(f"Error: Directory '{directory}' does not exist.")
         return False
     
-    # Handle destination directory
-    if destination_dir:
-        destination_dir = os.path.abspath(destination_dir)
-        if not os.path.exists(destination_dir):
-            print(f"Error: Destination directory '{destination_dir}' does not exist.")
-            return False
+    # Validate destination folder if provided
+    if destination_folder:
+        destination_folder = os.path.abspath(destination_folder)
+        if not os.path.exists(destination_folder):
+            print(f"Creating destination folder: {destination_folder}")
+            os.makedirs(destination_folder, exist_ok=True)
     
     print(f"Scanning directory: {directory}")
     video_files = find_video_files(directory)
     
     if not video_files:
-        print("No video files found in the directory or subdirectories.")
+        print("No video files found in the directory.")
         return False
     
-    # Group files by type for display
-    driving_files = [f for f in video_files if 'Parking' not in f]
-    parking_files = [f for f in video_files if 'Parking' in f]
-    
-    print(f"\nFound {len(video_files)} total video files:")
-    print(f"  - {len(driving_files)} driving videos")
-    print(f"  - {len(parking_files)} parking videos")
-    
-    print("\nFirst few files (chronologically):")
+    print(f"Found {len(video_files)} video files:")
     for i, video in enumerate(video_files[:5], 1):
-        filename = os.path.basename(video)
-        folder = "Parking" if "Parking" in video else "Movie"
-        print(f"  {i}. [{folder}] {filename}")
+        print(f"  {i}. {video}")
     if len(video_files) > 5:
         print(f"  ... and {len(video_files) - 5} more")
     
     # Calculate total size
-    total_size_mb = get_total_size(video_files)
+    total_size_mb = get_total_size(directory, video_files)
     print(f"\nTotal size: {total_size_mb:.1f} MB")
     
     # Create temporary concat file
     concat_file = os.path.join(directory, 'concat_list.txt')
-    create_concat_file(video_files, concat_file)
+    create_concat_file(video_files, directory, concat_file)
     
     # Build output path
     if not output_file:
         output_file = 'stitched_output.mp4'
     
-    # Apply destination directory if specified
-    if destination_dir:
-        output_file = os.path.join(destination_dir, os.path.basename(output_file))
-    elif not os.path.isabs(output_file):
-        # If no destination and output is relative, put it in source directory
-        output_file = os.path.join(directory, output_file)
+    # If output_file is just a filename (no path), use destination folder or source directory
+    if not os.path.dirname(output_file):
+        if destination_folder:
+            output_file = os.path.join(destination_folder, output_file)
+        else:
+            output_file = os.path.join(directory, output_file)
+    # If output_file has a path but destination_folder is specified, warn user
+    elif destination_folder:
+        print(f"Warning: Output file has a path specified. Ignoring destination folder.")
+    
+    output_file = os.path.abspath(output_file)
     
     print(f"\nStitching videos into: {output_file}")
     print("Processing...\n")
@@ -155,26 +148,26 @@ def stitch_videos(directory, output_file, destination_dir=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python dashcam_stitcher.py <source_directory> [output_file] [--dest <destination_directory>]")
+        print("Usage: python dashcam_stitcher.py <directory> [output_file] [--dest <destination_folder>]")
         print("\nExamples:")
-        print("  python dashcam_stitcher.py E:\\DCIM")
-        print("  python dashcam_stitcher.py E:\\DCIM my_trip.mp4")
-        print("  python dashcam_stitcher.py E:\\DCIM --dest D:\\Videos")
-        print("  python dashcam_stitcher.py E:\\DCIM my_trip.mp4 --dest D:\\Videos")
+        print("  python dashcam_stitcher.py C:\\DashcamFootage")
+        print("  python dashcam_stitcher.py C:\\DashcamFootage output.mp4")
+        print("  python dashcam_stitcher.py C:\\DashcamFootage --dest C:\\ProcessedVideos")
+        print("  python dashcam_stitcher.py C:\\DashcamFootage output.mp4 --dest C:\\ProcessedVideos")
         sys.exit(1)
     
     directory = sys.argv[1]
     output_file = None
-    destination_dir = None
+    destination_folder = None
     
     # Parse arguments
     i = 2
     while i < len(sys.argv):
         if sys.argv[i] == '--dest' and i + 1 < len(sys.argv):
-            destination_dir = sys.argv[i + 1]
+            destination_folder = sys.argv[i + 1]
             i += 2
         else:
             output_file = sys.argv[i]
             i += 1
     
-    stitch_videos(directory, output_file, destination_dir)
+    stitch_videos(directory, output_file, destination_folder)
