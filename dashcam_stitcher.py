@@ -1,228 +1,336 @@
+#!/usr/bin/env python3
+"""Stitch dashcam clips (driving + parking) into one continuous video with ffmpeg."""
+
+import argparse
 import os
-import sys
-import subprocess
 import re
+import subprocess
+import sys
+import tempfile
 import time
-from pathlib import Path
+from collections import deque
+
+VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv')
+DEFAULT_OUTPUT = 'stitched_output.mp4'
+STDERR_TAIL_LINES = 200
+
+
+def enable_unicode_output():
+    """Keep the ✓/⚠ glyphs working when stdout is redirected on a non-UTF-8 locale."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except (ValueError, OSError):
+                pass
+
+
+def find_subfolder(directory, name):
+    """Return the path to a subfolder, matching case-insensitively."""
+    target = name.lower()
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.lower() == target:
+            path = os.path.join(directory, entry)
+            if os.path.isdir(path):
+                return path
+    return None
+
+
+def natural_key(filename):
+    """Sort key that orders REC_2 before REC_10 instead of after it.
+
+    Digit runs compare numerically and everything else compares as lowercased
+    text, so both zero-padded timestamps (2024_0101_120000_F.MP4) and bare
+    sequence numbers (REC_2.MP4) end up in the order the camera recorded them.
+    """
+    parts = re.split(r'(\d+)', filename)
+    return [(0, int(part), '') if part.isdigit() else (1, 0, part.lower())
+            for part in parts]
+
 
 def detect_dcim_structure(directory):
     """Detect if directory is DCIM root and return Movie folder path."""
-    # Check if this is DCIM folder with Movie subfolder
-    movie_path = os.path.join(directory, 'Movie')
-    if os.path.exists(movie_path) and os.path.isdir(movie_path):
+    movie_path = find_subfolder(directory, 'Movie')
+    if movie_path:
         print(f"✓ Detected DCIM structure at: {directory}")
-        return movie_path
-    return None
+    return movie_path
 
-def find_video_files(directory):
-    """Find all video files including from Parking subfolder and sort chronologically."""
-    video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.MP4', '.AVI', '.MOV', '.MKV')
-    video_files = []
-    
-    # Check if we're pointing to DCIM folder
+
+def collect_videos(folder, tag, exclude):
+    """Return (tag, path) pairs for video files directly inside folder."""
+    found = []
+    try:
+        entries = os.listdir(folder)
+    except OSError as exc:
+        print(f"⚠ Warning: could not read {folder}: {exc}")
+        return found
+    for entry in entries:
+        # Skip hidden files (this also covers macOS ._ metadata files)
+        if entry.startswith('.'):
+            continue
+        path = os.path.join(folder, entry)
+        if not entry.lower().endswith(VIDEO_EXTENSIONS):
+            continue
+        if not os.path.isfile(path):
+            continue
+        if os.path.realpath(path) in exclude:
+            print(f"  (skipping {entry} — it is this run's output file)")
+            continue
+        found.append((tag, path))
+    return found
+
+
+def find_video_files(directory, exclude=frozenset()):
+    """Find videos in the Movie folder and its Parking subfolder, oldest first."""
     movie_folder = detect_dcim_structure(directory)
     if movie_folder:
         directory = movie_folder
         print(f"✓ Processing Movie folder: {directory}")
-    
-    # Collect driving footage from main Movie folder
+
     print(f"Scanning for driving footage in: {directory}")
-    driving_count = 0
-    for file in os.listdir(directory):
-        # Skip hidden files, macOS metadata files, and directories
-        if file.startswith('.') or file.startswith('._'):
-            continue
-        file_path = os.path.join(directory, file)
-        if os.path.isfile(file_path) and file.endswith(video_extensions):
-            video_files.append(('driving', file_path))
-            driving_count += 1
-    print(f"✓ Found {driving_count} driving footage files")
-    
-    # Collect parking footage from Parking subfolder
-    parking_folder = os.path.join(directory, 'Parking')
-    parking_count = 0
-    if os.path.exists(parking_folder) and os.path.isdir(parking_folder):
+    video_files = collect_videos(directory, 'driving', exclude)
+    print(f"✓ Found {len(video_files)} driving footage files")
+
+    parking_folder = find_subfolder(directory, 'Parking')
+    if parking_folder:
         print(f"Scanning for parking footage in: {parking_folder}")
-        for file in os.listdir(parking_folder):
-            if file.startswith('.') or file.startswith('._'):
-                continue
-            file_path = os.path.join(parking_folder, file)
-            if os.path.isfile(file_path) and file.endswith(video_extensions):
-                video_files.append(('parking', file_path))
-                parking_count += 1
-        print(f"✓ Found {parking_count} parking footage files")
+        parking = collect_videos(parking_folder, 'parking', exclude)
+        print(f"✓ Found {len(parking)} parking footage files")
+        video_files.extend(parking)
     else:
-        print(f"⚠ Warning: No Parking subfolder found at {parking_folder}")
-    
-    # Sort by filename (chronological order based on timestamp in filename)
-    # Extract just the filename for sorting, not the full path
-    video_files.sort(key=lambda x: os.path.basename(x[1]))
-    
+        print(f"⚠ Warning: No Parking subfolder found in {directory}")
+
+    video_files.sort(key=lambda item: natural_key(os.path.basename(item[1])))
     return video_files
 
+
 def create_concat_file(video_files, concat_file_path):
-    """Create a text file listing all videos for ffmpeg concat."""
-    with open(concat_file_path, 'w') as f:
-        for video_type, video_path in video_files:
-            # Use absolute paths and escape special characters
-            video_path = os.path.abspath(video_path)
-            video_path = video_path.replace('\\', '/')
-            f.write(f"file '{video_path}'\n")
+    """Write the ffmpeg concat manifest listing all videos."""
+    with open(concat_file_path, 'w', encoding='utf-8') as handle:
+        for _video_type, video_path in video_files:
+            path = os.path.abspath(video_path)
+            # The concat demuxer ends a quoted filename at the first bare
+            # apostrophe, so a path like "Dan's Drive" must escape it.
+            path = path.replace("'", r"'\''")
+            handle.write(f"file '{path}'\n")
+
 
 def get_total_size(video_files):
     """Calculate total size of all video files in MB."""
     total_bytes = 0
-    for video_type, video_path in video_files:
+    for _video_type, video_path in video_files:
         try:
             total_bytes += os.path.getsize(video_path)
-        except Exception as e:
-            print(f"⚠ Warning: Could not get size of {os.path.basename(video_path)}: {e}")
-    return total_bytes / (1024 * 1024)  # Convert to MB
+        except OSError as exc:
+            print(f"⚠ Warning: Could not get size of {os.path.basename(video_path)}: {exc}")
+    return total_bytes / (1024 * 1024)
 
-def stitch_videos(directory, output_file, destination_folder=None):
+
+def resolve_output_path(directory, output_file, destination_folder):
+    """Work out the final output path before any scanning happens."""
+    if not output_file:
+        output_file = DEFAULT_OUTPUT
+    if os.path.dirname(output_file):
+        if destination_folder:
+            print("⚠ Warning: output file already includes a path. Ignoring --dest.")
+        return os.path.abspath(output_file)
+    base = destination_folder or directory
+    return os.path.abspath(os.path.join(base, output_file))
+
+
+def confirm_overwrite(output_file, force):
+    """Ask before replacing an existing output file."""
+    if force or not os.path.exists(output_file):
+        return True
+    if not sys.stdin.isatty():
+        print(f"✗ Error: '{output_file}' already exists. Re-run with --force to overwrite.")
+        return False
+    try:
+        answer = input(f"⚠ '{output_file}' already exists. Overwrite? [y/N] ")
+    except EOFError:
+        answer = ''
+    if answer.strip().lower() in ('y', 'yes'):
+        return True
+    print("Not overwriting - exiting.")
+    return False
+
+
+def run_ffmpeg(concat_file, output_file):
+    """Run ffmpeg, echoing its progress. Returns the exit code, or None if missing."""
+    cmd = [
+        'ffmpeg',
+        '-hide_banner',
+        '-nostdin',
+        '-y',
+        # genpts is a demuxer flag: it only takes effect before -i.
+        '-fflags', '+genpts',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        '-v', 'warning',
+        '-stats',
+        output_file,
+    ]
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        return None
+
+    tail = deque(maxlen=STDERR_TAIL_LINES)
+    stats_pending = False
+    for line in process.stderr:
+        tail.append(line)
+        text = line.rstrip('\r\n')
+        if not text:
+            continue
+        if text.startswith(('frame=', 'size=')):
+            # Progress updates overwrite in place rather than scrolling.
+            print(f"  {text}", end='\r', file=sys.stderr, flush=True)
+            stats_pending = True
+        else:
+            if stats_pending:
+                print(file=sys.stderr)
+                stats_pending = False
+            print(f"⚠ {text}", file=sys.stderr)
+    if stats_pending:
+        print(file=sys.stderr)
+
+    process.wait()
+    return process.returncode, list(tail)
+
+
+def stitch_videos(directory, output_file=None, destination_folder=None, force=False):
     """Stitch all videos in the directory into one file."""
     directory = os.path.abspath(directory)
-    
-    if not os.path.exists(directory):
-        print(f"Error: Directory '{directory}' does not exist.")
+
+    if not os.path.isdir(directory):
+        if os.path.exists(directory):
+            print(f"Error: '{directory}' is a file, not a directory.")
+        else:
+            print(f"Error: Directory '{directory}' does not exist.")
         return False
-    
-    # Validate destination folder if provided
+
     if destination_folder:
         destination_folder = os.path.abspath(destination_folder)
-        if not os.path.exists(destination_folder):
+        if not os.path.isdir(destination_folder):
             print(f"Creating destination folder: {destination_folder}")
-            os.makedirs(destination_folder, exist_ok=True)
-    
+            try:
+                os.makedirs(destination_folder, exist_ok=True)
+            except OSError as exc:
+                print(f"✗ Error: could not create destination folder: {exc}")
+                return False
+
+    output_file = resolve_output_path(directory, output_file, destination_folder)
+
     print(f"Scanning directory: {directory}\n")
-    video_files = find_video_files(directory)
-    
+    # Exclude the output so a second run never swallows the first run's file.
+    video_files = find_video_files(directory, exclude={os.path.realpath(output_file)})
+
     if not video_files:
         print("✗ Error: No video files found in the directory.")
         return False
-    
+
     print(f"\n✓ Found {len(video_files)} total video files")
-    print(f"First 5 files in chronological order:")
-    for i, (video_type, video_path) in enumerate(video_files[:5], 1):
-        filename = os.path.basename(video_path)
-        print(f"  {i}. [{video_type.upper()}] {filename}")
+    print("First 5 files in chronological order:")
+    for index, (video_type, video_path) in enumerate(video_files[:5], 1):
+        print(f"  {index}. [{video_type.upper()}] {os.path.basename(video_path)}")
     if len(video_files) > 5:
         print(f"  ... and {len(video_files) - 5} more")
-    
-    # Calculate total size
+
     total_size_mb = get_total_size(video_files)
     print(f"\nTotal size: {total_size_mb:.1f} MB")
-    
-    # Create temporary concat file in the source directory
-    source_dir = os.path.dirname(video_files[0][1])
-    concat_file = os.path.join(source_dir, 'concat_list.txt')
-    create_concat_file(video_files, concat_file)
-    
-    # Build output path
-    if not output_file:
-        output_file = 'stitched_output.mp4'
-    
-    # If output_file is just a filename (no path), use destination folder or source directory
-    if not os.path.dirname(output_file):
-        if destination_folder:
-            output_file = os.path.join(destination_folder, output_file)
-        else:
-            output_file = os.path.join(directory, output_file)
-    # If output_file has a path but destination_folder is specified, warn user
-    elif destination_folder:
-        print(f"Warning: Output file has a path specified. Ignoring destination folder.")
-    
-    output_file = os.path.abspath(output_file)
-    
+
+    if not confirm_overwrite(output_file, force):
+        return False
+
     print(f"\nStitching videos into: {output_file}")
     print("Processing...\n")
-    
-    # Run ffmpeg with file-by-file logging
+
+    # Keep the manifest off the source volume — SD cards are often full or
+    # write-protected — and remove it even when ffmpeg never starts.
+    handle = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', prefix='dashcam_concat_', delete=False, encoding='utf-8')
+    handle.close()
+    concat_file = handle.name
+
     start_time = time.time()
     try:
-        cmd = [
-            'ffmpeg',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', concat_file,
-            '-c', 'copy',
-            '-fflags', '+genpts',
-            '-movflags', '+faststart',
-            '-v', 'warning',
-            '-stats',
-            output_file
-        ]
-        
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                   universal_newlines=True, bufsize=1)
-        
-        file_count = 0
-        stderr_output = []
-        for line in process.stderr:
-            stderr_output.append(line)
-            # Log when each file is being processed (works for any video extension)
-            if "Opening '" in line and any(ext in line for ext in ['.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV', '.mkv', '.MKV']):
-                file_count += 1
-                filename = line.split("'")[1].split('/')[-1].split('\\')[-1]
-                # Determine if it's parking or driving based on filename
-                file_type = 'PARKING' if 'PF.' in filename else 'DRIVING'
-                print(f"[{file_count}/{len(video_files)}] Processing [{file_type}]: {filename}")
-            # Show warnings and errors
-            elif 'warning' in line.lower() or 'error' in line.lower():
-                print(f"⚠ {line.strip()}")
-        
-        process.wait()
-        
-        # Clean up concat file
+        create_concat_file(video_files, concat_file)
+        result = run_ffmpeg(concat_file, output_file)
+    except OSError as exc:
+        print(f"\n✗ Error: {exc}")
+        return False
+    finally:
         try:
             os.remove(concat_file)
-        except Exception as e:
-            print(f"⚠ Warning: Could not remove concat file: {e}")
-        
-        if process.returncode == 0:
-            elapsed = time.time() - start_time
-            print(f"\n✓ Success! Completed in {int(elapsed)} seconds")
-            print(f"✓ Processed {len(video_files)} files")
-            print(f"✓ Total size: {total_size_mb:.1f} MB")
-            print(f"✓ Output: {output_file}")
-            return True
-        else:
-            print(f"\n✗ Error during stitching (exit code: {process.returncode})")
-            print("FFmpeg error output:")
-            for line in stderr_output:
-                print(f"  {line.rstrip()}")
-            return False
-            
-    except FileNotFoundError:
+        except OSError as exc:
+            print(f"⚠ Warning: Could not remove concat file: {exc}")
+
+    if result is None:
         print("\n✗ Error: ffmpeg not found. Please install ffmpeg first.")
         print("Download from: https://ffmpeg.org/download.html")
         return False
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
+
+    returncode, stderr_tail = result
+    if returncode != 0:
+        print(f"\n✗ Error during stitching (exit code: {returncode})")
+        print("FFmpeg error output:")
+        for line in stderr_tail:
+            print(f"  {line.rstrip()}")
         return False
 
+    elapsed = int(time.time() - start_time)
+    print(f"\n✓ Success! Completed in {elapsed} seconds")
+    print(f"✓ Processed {len(video_files)} files")
+    print(f"✓ Total size: {total_size_mb:.1f} MB")
+    print(f"✓ Output: {output_file}")
+    return True
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='dashcam_stitcher.py',
+        description='Stitch dashcam videos into one continuous file.',
+        epilog=(
+            'Examples:\n'
+            '  python dashcam_stitcher.py E:\\DCIM\n'
+            '  python dashcam_stitcher.py E:\\DCIM my_trip.mp4\n'
+            '  python dashcam_stitcher.py E:\\DCIM --dest D:\\Videos\n'
+            '  python dashcam_stitcher.py E:\\DCIM my_trip.mp4 --dest D:\\Videos\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('directory', help='folder holding the footage (DCIM root or Movie folder)')
+    parser.add_argument('output_file', nargs='?', default=None,
+                        help=f'output filename (default: {DEFAULT_OUTPUT})')
+    parser.add_argument('--dest', dest='destination_folder', metavar='FOLDER',
+                        help='folder to write the output into')
+    parser.add_argument('-f', '--force', action='store_true',
+                        help='overwrite the output file without asking')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    enable_unicode_output()
+    args = parse_args(argv)
+    ok = stitch_videos(args.directory, args.output_file,
+                       args.destination_folder, args.force)
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python dashcam_stitcher.py <directory> [output_file] [--dest <destination_folder>]")
-        print("\nExamples:")
-        print("  python dashcam_stitcher.py C:\\DashcamFootage")
-        print("  python dashcam_stitcher.py C:\\DashcamFootage output.mp4")
-        print("  python dashcam_stitcher.py C:\\DashcamFootage --dest C:\\ProcessedVideos")
-        print("  python dashcam_stitcher.py C:\\DashcamFootage output.mp4 --dest C:\\ProcessedVideos")
-        sys.exit(1)
-    
-    directory = sys.argv[1]
-    output_file = None
-    destination_folder = None
-    
-    # Parse arguments
-    i = 2
-    while i < len(sys.argv):
-        if sys.argv[i] == '--dest' and i + 1 < len(sys.argv):
-            destination_folder = sys.argv[i + 1]
-            i += 2
-        else:
-            output_file = sys.argv[i]
-            i += 1
-    
-    stitch_videos(directory, output_file, destination_folder)
+    sys.exit(main())
